@@ -53,10 +53,10 @@ function App() {
       
       if (result.success) {
         // Only show toast if something was synced
-        if (!isSilent && pendingOps.length > 0) {
+        if (!isSilent && result.syncedCount > 0) {
           setSyncToast({
             type: 'success',
-            message: `Synced ${pendingOps.length} change${pendingOps.length > 1 ? 's' : ''}`
+            message: `Synced ${result.syncedCount} change${result.syncedCount > 1 ? 's' : ''}`
           });
         } else if (!isSilent && result.deletedCount > 0) {
           setSyncToast({
@@ -71,7 +71,9 @@ function App() {
         }
         setSyncToast({
           type: 'error',
-          message: 'Sync failed. Try again later.'
+          message: result.syncedCount > 0
+            ? `Synced ${result.syncedCount}; ${result.failedCount || 'some'} change(s) still pending.`
+            : 'Sync failed. Changes remain saved on this device.'
         });
       }
     } catch (error) {

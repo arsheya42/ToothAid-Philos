@@ -216,7 +216,9 @@ const SyncPage = ({ token, setToken }) => {
           }}>
             {syncResult.success
               ? (syncResult.message || 'Sync completed successfully!')
-              : `Sync failed: ${syncResult.error}`
+              : syncResult.syncedCount > 0
+                ? `${syncResult.syncedCount} synced; ${syncResult.failedCount || 'some'} still pending. ${syncResult.error}`
+                : `Sync failed; changes remain on this device. ${syncResult.error}`
             }
           </p>
         </div>

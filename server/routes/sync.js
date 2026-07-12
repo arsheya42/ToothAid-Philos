@@ -478,9 +478,19 @@ router.get('/pull', authenticateToken, async (req, res) => {
   try {
     const since = req.query.since ? new Date(req.query.since) : new Date(0);
     const scope = req.query.scope || 'ALL';
+    // Freeze the sync watermark before querying. Writes that happen during this
+    // request remain newer than the returned cursor and are picked up next time.
+    const syncWatermark = new Date();
 
-    const childrenQuery = { updatedAt: { $gte: since } };
-    const visitsQuery = { createdAt: { $gte: since } };
+    const childrenQuery = { updatedAt: { $gte: since, $lte: syncWatermark } };
+    // New visits use createdAt; edits to older visits must also be visible to other
+    // devices through updatedAt.
+    const visitsQuery = {
+      $or: [
+        { createdAt: { $gte: since, $lte: syncWatermark } },
+        { updatedAt: { $gte: since, $lte: syncWatermark } }
+      ]
+    };
 
     // Apply scope filtering (school or barangay)
     if (scope !== 'ALL') {
@@ -530,7 +540,7 @@ router.get('/pull', authenticateToken, async (req, res) => {
       allVisitIds, // All current visit IDs on server (for deletion detection)
       allClinicDayIds, // All current clinic day IDs on server (for deletion detection)
       allAppointmentIds, // All current appointment IDs on server (for deletion detection)
-      serverTime: new Date().toISOString()
+      serverTime: syncWatermark.toISOString()
     });
   } catch (error) {
     console.error('Sync pull error:', error);
