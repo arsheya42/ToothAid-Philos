@@ -26,7 +26,24 @@ const corsOptions = frontendOrigin
   ? { origin: frontendOrigin.split(',').map((o) => o.trim()).filter(Boolean), credentials: true }
   : { origin: true }; // allow any origin when unset so mobile/deployed frontends work
 app.use(cors(corsOptions));
+// A device can accumulate a large offline outbox. Express' 100 KB default rejects
+// that request before it reaches /sync/push, leaving the device unable to recover.
+// Keep the larger, configurable allowance scoped to the sync endpoint; all other
+// JSON endpoints retain Express' conservative default.
+app.use('/sync/push', express.json({ limit: process.env.SYNC_PUSH_BODY_LIMIT || '10mb' }));
 app.use(express.json());
+
+// Return JSON for oversized payloads so older clients surface a useful sync error
+// instead of receiving Express' default HTML error page.
+app.use((error, req, res, next) => {
+  if (error?.type === 'entity.too.large') {
+    return res.status(413).json({
+      error: 'Sync payload too large',
+      details: 'The pending changes exceed the server upload limit.'
+    });
+  }
+  return next(error);
+});
 
 
 
