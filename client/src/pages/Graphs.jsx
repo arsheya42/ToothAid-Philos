@@ -315,56 +315,34 @@ const Graphs = () => {
         );
         if (!shouldContinue) {
           setAppUpdateMsg('Update cancelled. Sync your changes first, then try again.');
+          setAppUpdating(false);
           return;
         }
       }
 
-      let registration = await navigator.serviceWorker.getRegistration();
-      if (!registration) {
-        registration = await navigator.serviceWorker.register('/sw.js');
+      setAppUpdateMsg('Clearing app cache and loading the latest version...');
+
+      if ('caches' in window) {
+        const cacheNames = await caches.keys();
+        await Promise.all(cacheNames.map((cacheName) => caches.delete(cacheName)));
       }
 
-      const reloadWhenActivated = () => {
-        navigator.serviceWorker.addEventListener('controllerchange', () => {
-          window.location.reload();
-        }, { once: true });
-      };
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map((registration) => registration.unregister()));
 
-      if (registration.waiting) {
-        setAppUpdateMsg('New version found. Reloading...');
-        reloadWhenActivated();
-        registration.waiting.postMessage({ type: 'SKIP_WAITING' });
-        return;
-      }
-
-      setAppUpdateMsg('Checking for app update...');
-      await registration.update();
-
-      if (registration.waiting) {
-        setAppUpdateMsg('New version found. Reloading...');
-        reloadWhenActivated();
-        registration.waiting.postMessage({ type: 'SKIP_WAITING' });
-        return;
-      }
-
-      const installingWorker = registration.installing;
-      if (installingWorker) {
-        setAppUpdateMsg('New version found. Preparing update...');
-        installingWorker.addEventListener('statechange', () => {
-          if (installingWorker.state === 'installed' && registration.waiting) {
-            setAppUpdateMsg('New version ready. Reloading...');
-            reloadWhenActivated();
-            registration.waiting.postMessage({ type: 'SKIP_WAITING' });
-          }
-        });
-        return;
-      }
-
-      setAppUpdateMsg('App is already up to date.');
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set('app_update', String(Date.now()));
+      window.location.replace(nextUrl.toString());
     } catch (e) {
-      setAppUpdateMsg(`App update failed: ${e?.message || 'unknown error'}`);
-    } finally {
-      setAppUpdating(false);
+      try {
+        const registration = await navigator.serviceWorker.getRegistration();
+        await registration?.update();
+        window.location.reload();
+      } catch (fallbackError) {
+        console.error('Fallback app update failed:', fallbackError);
+        setAppUpdateMsg(`App update failed: ${e?.message || 'unknown error'}`);
+        setAppUpdating(false);
+      }
     }
   };
 

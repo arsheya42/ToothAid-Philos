@@ -8,6 +8,18 @@ import { authenticateToken } from '../middleware/auth.js';
 
 const router = express.Router();
 
+const SUPPORTED_SYNC_ACTIONS = new Set([
+  'UPSERT_CHILD',
+  'ADD_VISIT',
+  'UPSERT_CLINIC_DAY',
+  'UPSERT_APPOINTMENT',
+  'DELETE_APPOINTMENT',
+  'DELETE_CLINIC_DAY',
+  'DELETE_CHILD',
+  'DELETE_VISIT',
+  'UPDATE_VISIT'
+]);
+
 // Ensure treatmentTypes is always an array of strings for DB storage
 function normalizeTreatmentTypes(value) {
   if (Array.isArray(value)) {
@@ -52,8 +64,35 @@ router.post('/push', authenticateToken, async (req, res) => {
     const ackedOpIds = [];
     const errors = [];
 
+    // Log identifiers and counts only; never log medical payload contents.
+    const deviceIds = new Set(ops.map((op) => op?.deviceId).filter(Boolean));
+    const actionCounts = ops.reduce((counts, op) => {
+      const action = typeof op?.action === 'string' ? op.action : 'INVALID';
+      counts[action] = (counts[action] || 0) + 1;
+      return counts;
+    }, {});
+    console.info('Sync push received', {
+      opCount: ops.length,
+      deviceCount: deviceIds.size,
+      actionCounts,
+      contentLength: req.get('content-length') || 'unknown'
+    });
+
     for (const op of ops) {
       try {
+        if (!op || typeof op !== 'object') {
+          throw new Error('Invalid sync operation');
+        }
+        if (typeof op.opId !== 'string' || op.opId.trim() === '') {
+          throw new Error('Sync operation is missing opId');
+        }
+        if (!SUPPORTED_SYNC_ACTIONS.has(op.action)) {
+          throw new Error(`Unsupported sync action: ${String(op.action)}`);
+        }
+        if (!op.payload || typeof op.payload !== 'object' || Array.isArray(op.payload)) {
+          throw new Error(`Invalid payload for sync action: ${op.action}`);
+        }
+
         // Check if operation already processed (idempotency)
         const existing = await ProcessedOp.findOne({ opId: op.opId });
         if (existing) {
@@ -401,16 +440,33 @@ router.post('/push', authenticateToken, async (req, res) => {
         await ProcessedOp.create({ opId: op.opId });
         ackedOpIds.push(op.opId);
       } catch (error) {
-        console.error(`Error processing op ${op.opId}:`, error);
-        errors.push({ opId: op.opId, error: error.message });
+        const opId = typeof op?.opId === 'string' ? op.opId : null;
+        console.error('Error processing sync operation', {
+          opId,
+          action: typeof op?.action === 'string' ? op.action : null,
+          error: error.message
+        });
+        errors.push({ opId, error: error.message });
       }
     }
 
-    res.json({
+    const responseBody = {
       ackedOpIds,
       errors: errors.length > 0 ? errors : undefined,
       serverTime: new Date().toISOString()
-    });
+    };
+
+    // A non-2xx response prevents existing clients from pulling/deleting local-only
+    // data after a partial push. Successfully processed ops remain idempotent and
+    // will be acknowledged again on the next retry.
+    if (errors.length > 0) {
+      return res.status(422).json({
+        error: 'One or more sync operations failed',
+        ...responseBody
+      });
+    }
+
+    return res.json(responseBody);
   } catch (error) {
     console.error('Sync push error:', error);
     res.status(500).json({ error: 'Sync failed', details: error.message });
@@ -422,9 +478,19 @@ router.get('/pull', authenticateToken, async (req, res) => {
   try {
     const since = req.query.since ? new Date(req.query.since) : new Date(0);
     const scope = req.query.scope || 'ALL';
+    // Freeze the sync watermark before querying. Writes that happen during this
+    // request remain newer than the returned cursor and are picked up next time.
+    const syncWatermark = new Date();
 
-    const childrenQuery = { updatedAt: { $gte: since } };
-    const visitsQuery = { createdAt: { $gte: since } };
+    const childrenQuery = { updatedAt: { $gte: since, $lte: syncWatermark } };
+    // New visits use createdAt; edits to older visits must also be visible to other
+    // devices through updatedAt.
+    const visitsQuery = {
+      $or: [
+        { createdAt: { $gte: since, $lte: syncWatermark } },
+        { updatedAt: { $gte: since, $lte: syncWatermark } }
+      ]
+    };
 
     // Apply scope filtering (school or barangay)
     if (scope !== 'ALL') {
@@ -474,7 +540,7 @@ router.get('/pull', authenticateToken, async (req, res) => {
       allVisitIds, // All current visit IDs on server (for deletion detection)
       allClinicDayIds, // All current clinic day IDs on server (for deletion detection)
       allAppointmentIds, // All current appointment IDs on server (for deletion detection)
-      serverTime: new Date().toISOString()
+      serverTime: syncWatermark.toISOString()
     });
   } catch (error) {
     console.error('Sync pull error:', error);

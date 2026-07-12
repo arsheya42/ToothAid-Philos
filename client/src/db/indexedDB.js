@@ -675,34 +675,79 @@ export const getAppointmentCountForClinicDay = async (clinicDayId, status = null
 };
 
 // Sync operations
+const SYNC_PUSH_MAX_OPS = 50;
+const SYNC_PUSH_MAX_BYTES = 256 * 1024;
+
+const getJsonByteLength = (value) => new Blob([JSON.stringify(value)]).size;
+
+const createSyncPushBatches = (ops) => {
+  const batches = [];
+  let current = [];
+
+  for (const op of ops) {
+    const candidate = [...current, op];
+    const exceedsCount = candidate.length > SYNC_PUSH_MAX_OPS;
+    const exceedsBytes = getJsonByteLength({ ops: candidate }) > SYNC_PUSH_MAX_BYTES;
+
+    if (current.length > 0 && (exceedsCount || exceedsBytes)) {
+      batches.push(current);
+      current = [op];
+    } else {
+      current = candidate;
+    }
+  }
+
+  if (current.length > 0) batches.push(current);
+  return batches;
+};
+
 export const syncPush = async (token) => {
   const ops = await getOutboxOps();
-  if (ops.length === 0) return { ackedOpIds: [] };
-
-  const response = await fetch(`${API_BASE_URL}${getApiPath('/sync/push')}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`
-    },
-    body: JSON.stringify({ ops })
-  });
-
-  const result = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const msg = result?.error || result?.details || response.statusText;
-    throw new Error(`Sync push failed: ${msg}`);
+  if (ops.length === 0) {
+    return { ackedOpIds: [], attemptedCount: 0, failedCount: 0, batchCount: 0 };
   }
 
-  if (result.errors && result.errors.length > 0) {
-    console.warn('Sync push had errors for some ops:', result.errors);
+  const batches = createSyncPushBatches(ops);
+  const ackedOpIds = [];
+
+  for (const batch of batches) {
+    const response = await fetch(`${API_BASE_URL}${getApiPath('/sync/push')}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({ ops: batch })
+    });
+
+    const result = await response.json().catch(() => ({}));
+    const batchAckedIds = Array.isArray(result.ackedOpIds) ? result.ackedOpIds : [];
+
+    // ACKs are durable server confirmations, including those returned alongside a
+    // 422 partial failure. Remove only those exact operations from the outbox.
+    if (batchAckedIds.length > 0) {
+      await removeFromOutbox(batchAckedIds);
+      ackedOpIds.push(...batchAckedIds);
+    }
+
+    const operationErrors = Array.isArray(result.errors) ? result.errors : [];
+    if (!response.ok || operationErrors.length > 0) {
+      const msg = result?.error || result?.details || response.statusText || 'Unknown push error';
+      const error = new Error(`Sync push failed: ${msg}`);
+      error.ackedCount = ackedOpIds.length;
+      // Includes the failed batch and any later batches not attempted yet.
+      error.failedCount = ops.length - ackedOpIds.length;
+      error.operationErrors = operationErrors;
+      throw error;
+    }
   }
 
-  if (result.ackedOpIds && result.ackedOpIds.length > 0) {
-    await removeFromOutbox(result.ackedOpIds);
-  }
-  return result;
+  return {
+    ackedOpIds,
+    attemptedCount: ops.length,
+    failedCount: 0,
+    batchCount: batches.length
+  };
 };
 
 export const syncPull = async (token, since = null, scope = 'ALL') => {
@@ -783,17 +828,37 @@ export const syncPull = async (token, since = null, scope = 'ALL') => {
   let deletedClinicDaysCount = 0;
   let deletedAppointmentsCount = 0;
   
+  // Pending upserts must survive pull-side deletion: a local-only entity may not
+  // have reached the server yet, and deletion would hide the user's only copy.
+  const outboxOps = await getOutboxOps();
+  const pendingChildUpserts = new Set(
+    outboxOps.filter((o) => o.action === 'UPSERT_CHILD' && o.entityId).map((o) => o.entityId)
+  );
+  const pendingVisitUpserts = new Set(
+    outboxOps
+      .filter((o) => (o.action === 'ADD_VISIT' || o.action === 'UPDATE_VISIT') && o.entityId)
+      .map((o) => o.entityId)
+  );
+  const pendingClinicDayUpserts = new Set(
+    outboxOps.filter((o) => o.action === 'UPSERT_CLINIC_DAY' && o.entityId).map((o) => o.entityId)
+  );
+  const pendingAppointmentUpserts = new Set(
+    outboxOps.filter((o) => o.action === 'UPSERT_APPOINTMENT' && o.entityId).map((o) => o.entityId)
+  );
+
   if (result.allChildIds && Array.isArray(result.allChildIds)) {
     const localChildren = await db.children.toCollection().primaryKeys();
     const serverChildIds = new Set(result.allChildIds);
-    const toDelete = localChildren.filter(id => !serverChildIds.has(id));
+    const toDelete = localChildren.filter(
+      (id) => !serverChildIds.has(id) && !pendingChildUpserts.has(id)
+    );
     
     if (toDelete.length > 0) {
       // Also delete visits for deleted children
       const deletedChildIds = new Set(toDelete);
       const allVisits = await db.visits.toArray();
       const visitsToDelete = allVisits
-        .filter(v => deletedChildIds.has(v.childId))
+        .filter(v => deletedChildIds.has(v.childId) && !pendingVisitUpserts.has(v.visitId))
         .map(v => v.visitId);
       
       if (visitsToDelete.length > 0) {
@@ -806,20 +871,12 @@ export const syncPull = async (token, since = null, scope = 'ALL') => {
     }
   }
   
-  // Pending upserts must survive pull-side deletion: push may fail or not be acked yet,
-  // but we would otherwise remove "only local" rows and make batch edits look like no-ops.
-  const outboxOps = await getOutboxOps();
-  const pendingClinicDayUpserts = new Set(
-    outboxOps.filter((o) => o.action === 'UPSERT_CLINIC_DAY' && o.entityId).map((o) => o.entityId)
-  );
-  const pendingAppointmentUpserts = new Set(
-    outboxOps.filter((o) => o.action === 'UPSERT_APPOINTMENT' && o.entityId).map((o) => o.entityId)
-  );
-
   if (result.allVisitIds && Array.isArray(result.allVisitIds)) {
     const localVisits = await db.visits.toCollection().primaryKeys();
     const serverVisitIds = new Set(result.allVisitIds);
-    const toDelete = localVisits.filter(id => !serverVisitIds.has(id));
+    const toDelete = localVisits.filter(
+      (id) => !serverVisitIds.has(id) && !pendingVisitUpserts.has(id)
+    );
     
     if (toDelete.length > 0) {
       await db.visits.bulkDelete(toDelete);
@@ -883,13 +940,15 @@ export const syncPull = async (token, since = null, scope = 'ALL') => {
 export const performSync = async (token) => {
   try {
     // Push first
-    await syncPush(token);
+    const pushResult = await syncPush(token);
     
     // Then pull (this handles deletions and sets deletedCount on result)
     const pullResult = await syncPull(token);
     
     return { 
       success: true, 
+      syncedCount: pushResult.ackedOpIds.length,
+      batchCount: pushResult.batchCount,
       deletedCount: pullResult.deletedCount || 0,
       message: (pullResult.deletedCount || 0) > 0 
         ? `Sync completed. Removed ${pullResult.deletedCount} deleted record(s).` 
@@ -897,17 +956,24 @@ export const performSync = async (token) => {
     };
   } catch (error) {
     console.error('Sync error:', error);
-    return { success: false, error: error.message };
+    return {
+      success: false,
+      error: error.message,
+      syncedCount: error.ackedCount || 0,
+      failedCount: error.failedCount || 0
+    };
   }
 };
 
 // Force a full pull (ignores lastSyncAt) - useful for refreshing demo data
 export const performFullSync = async (token) => {
   try {
-    await syncPush(token);
+    const pushResult = await syncPush(token);
     const pullResult = await syncPull(token, '1970-01-01T00:00:00.000Z');
     return {
       success: true,
+      syncedCount: pushResult.ackedOpIds.length,
+      batchCount: pushResult.batchCount,
       deletedCount: pullResult.deletedCount || 0,
       message: 'Full sync completed successfully!'
     };
